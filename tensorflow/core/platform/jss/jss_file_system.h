@@ -19,7 +19,6 @@ limitations under the License.
 #include <string>
 #include <vector>
 #include "tensorflow/core/lib/core/status.h"
-#include "tensorflow/core/platform/cloud/auth_provider.h"
 #include "tensorflow/core/platform/cloud/http_request.h"
 #include "tensorflow/core/platform/cloud/retrying_file_system.h"
 #include "tensorflow/core/platform/file_system.h"
@@ -34,7 +33,7 @@ namespace tensorflow {
     public:
         JssFileSystem();
 
-        JssFileSystem(std::unique_ptr<AuthProvider> auth_provider,
+        JssFileSystem(std::unique_ptr<JssAuthProvider> auth_provider,
                       std::unique_ptr<HttpRequest::Factory> http_request_factory,
                       size_t read_ahead_bytes, int32 max_upload_attempts);
 
@@ -110,7 +109,7 @@ namespace tensorflow {
 
         Status RenameObject(const string &src, const string &target);
 
-        std::unique_ptr<AuthProvider> auth_provider_;
+        std::unique_ptr<JssAuthProvider> auth_provider_;
         std::unique_ptr<HttpRequest::Factory> http_request_factory_;
 
         // The number of bytes to read ahead for buffering purposes in the
@@ -129,6 +128,27 @@ namespace tensorflow {
     public:
         RetryingJssFileSystem()
                 : RetryingFileSystem(std::unique_ptr<FileSystem>(new JssFileSystem)) {}
+    };
+
+    class JssAuthProvider {
+    public:
+        JssAuthProvider();
+
+        JssAuthProvider(const string &access_key, const string &access_secret_key, const string &endpoint);
+
+        Status GetToken(HttpRequest *request, string *token,
+                        const string *method, const string *date, const string *customHead, const string *resource);
+
+        static Status GetToken(JssAuthProvider *provider, HttpRequest *request, string *token,
+                               const string *method, const string *date, const string *customHead,
+                               const string *resource);
+
+        const string GetEndPoint();
+
+    private:
+        string access_key_;
+        string access_secret_key_;
+        string endpoint_;
     };
 
 }  // namespace tensorflow

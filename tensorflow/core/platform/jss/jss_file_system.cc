@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/platform/jss/jss_file_system.h"
+#include "tensorflow/core/platform/jss/jss_util.h"
 #include <stdio.h>
 #include <unistd.h>
 #include <algorithm>
@@ -40,10 +41,10 @@ namespace tensorflow {
 
     namespace {
 
-        constexpr char kJssUriBase[] = "https://www.googleapis.com/storage/v1/";
+        constexpr char kJssUriBase[] = "https://storage.jd.local/";
         constexpr char kJssUploadUriBase[] =
-                "https://www.googleapis.com/upload/storage/v1/";
-        constexpr char kStorageHost[] = "storage.googleapis.com";
+                "https://storage.jd.local/";
+        constexpr char kStorageHost[] = "storage.jd.local";
         constexpr size_t kReadAppendableFileBufferSize = 1024 * 1024;  // In bytes.
         constexpr int kGetChildrenDefaultPageSize = 1000;
 // Initial delay before retrying a JSS upload.
@@ -207,7 +208,7 @@ namespace tensorflow {
         class JssRandomAccessFile : public RandomAccessFile {
         public:
             JssRandomAccessFile(const string &bucket, const string &object,
-                                AuthProvider *auth_provider,
+                                JssAuthProvider *auth_provider,
                                 HttpRequest::Factory *http_request_factory,
                                 size_t read_ahead_bytes)
                     : bucket_(bucket),
@@ -263,14 +264,24 @@ namespace tensorflow {
             /// buffer_ from JSS based on its current capacity.
             Status LoadBufferFromJSS() const EXCLUSIVE_LOCKS_REQUIRED(mu_) {
                 string auth_token;
-                TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_, &auth_token));
+                string method = "GET";
+                string date_str;
+                string customHead;
+                string resource;
 
                 std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
                 TF_RETURN_IF_ERROR(request->Init());
                 TF_RETURN_IF_ERROR(
-                        request->SetUri(strings::StrCat("https://", bucket_, ".", kStorageHost,
+                        request->SetUri(strings::StrCat("http://", auth_provider_->GetEndPoint(), "/", bucket_,
                                                         "/", request->EscapeString(object_))));
-                TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
+
+                TF_RETURN_IF_ERROR(get_time_str(&date_str));
+                TF_RETURN_IF_ERROR(request->AddHeader("Date", date_str));
+                resource = strings::StrCat("/", bucket_, "/", request->EscapeString(object_));
+                TF_RETURN_IF_ERROR(JssAuthProvider::GetToken(auth_provider_, request.get(), &auth_token,
+                                                             &method, &date_str, &customHead, &resource));
+                TF_RETURN_IF_ERROR(request->AddHeader("Authorization", auth_token));
+
                 TF_RETURN_IF_ERROR(request->SetRange(
                         buffer_start_offset_, buffer_start_offset_ + buffer_.capacity() - 1));
                 TF_RETURN_IF_ERROR(request->SetResultBuffer(&buffer_));
@@ -281,7 +292,7 @@ namespace tensorflow {
 
             string bucket_;
             string object_;
-            AuthProvider *auth_provider_;
+            JssAuthProvider *auth_provider_;
             HttpRequest::Factory *http_request_factory_;
             const size_t read_ahead_bytes_;
 
@@ -300,7 +311,7 @@ namespace tensorflow {
         class JssWritableFile : public WritableFile {
         public:
             JssWritableFile(const string &bucket, const string &object,
-                            AuthProvider *auth_provider,
+                            JssAuthProvider *auth_provider,
                             HttpRequest::Factory *http_request_factory,
                             int32 max_upload_attempts)
                     : bucket_(bucket),
@@ -320,7 +331,7 @@ namespace tensorflow {
             /// with the content to be appended. The class takes onwnership of the
             /// specified tmp file and deletes it on close.
             JssWritableFile(const string &bucket, const string &object,
-                            AuthProvider *auth_provider,
+                            JssAuthProvider *auth_provider,
                             const string &tmp_content_filename,
                             HttpRequest::Factory *http_request_factory,
                             int32 max_upload_attempts)
@@ -370,23 +381,9 @@ namespace tensorflow {
                     return errors::Internal(
                             "Could not write to the internal temporary file.");
                 }
-                string session_uri;
-                TF_RETURN_IF_ERROR(CreateNewUploadSession(&session_uri));
                 uint64 already_uploaded = 0;
-                for (int attempt = 0; attempt < max_upload_attempts_; attempt++) {
-                    if (attempt > 0) {
-                        bool completed;
-                        TF_RETURN_IF_ERROR(RequestUploadSessionStatus(session_uri, &completed,
-                                                                      &already_uploaded));
-                        if (completed) {
-                            // It's unclear why UploadToSession didn't return OK in the previous
-                            // attempt, but JSS reports that the file is fully uploaded,
-                            // so succeed.
-                            return Status::OK();
-                        }
-                    }
-                    const Status upload_status =
-                            UploadToSession(session_uri, already_uploaded);
+                for (int attempt = 0; attempt < max_upload_attempts_; attempt++) { // TODO make upload resumable
+                    const Status upload_status = UploadFile();
                     if (upload_status.ok()) {
                         return Status::OK();
                     }
@@ -432,108 +429,30 @@ namespace tensorflow {
                 return Status::OK();
             }
 
-            /// Initiates a new resumable upload session.
-            Status CreateNewUploadSession(string *session_uri) {
-                if (session_uri == nullptr) {
-                    return errors::Internal("'session_uri' cannot be nullptr.");
-                }
-                uint64 file_size;
-                TF_RETURN_IF_ERROR(GetCurrentFileSize(&file_size));
-
+            Status UploadFile() { // simple put file
                 string auth_token;
-                TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_, &auth_token));
-
-                std::vector<char> output_buffer;
-                std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
-                TF_RETURN_IF_ERROR(request->Init());
-                TF_RETURN_IF_ERROR(request->SetUri(strings::StrCat(
-                        kJssUploadUriBase, "b/", bucket_, "/o?uploadType=resumable&name=",
-                        request->EscapeString(object_))));
-                TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
-                TF_RETURN_IF_ERROR(request->AddHeader("X-Upload-Content-Length",
-                                                      std::to_string(file_size)));
-                TF_RETURN_IF_ERROR(request->SetPostEmptyBody());
-                TF_RETURN_IF_ERROR(request->SetResultBuffer(&output_buffer));
-                TF_RETURN_WITH_CONTEXT_IF_ERROR(
-                        request->Send(), " when initiating an upload to ", GetJssPath());
-                *session_uri = request->GetResponseHeader("Location");
-                if (session_uri->empty()) {
-                    return errors::Internal("Unexpected response from JSS when writing to ",
-                                            GetJssPath(),
-                                            ": 'Location' header not returned.");
-                }
-                return Status::OK();
-            }
-
-            /// \brief Requests status of a previously initiated upload session.
-            ///
-            /// If the upload has already succeeded, sets 'completed' to true.
-            /// Otherwise sets 'completed' to false and 'uploaded' to the currently
-            /// uploaded size in bytes.
-            Status RequestUploadSessionStatus(const string &session_uri, bool *completed,
-                                              uint64 *uploaded) {
-                if (completed == nullptr || uploaded == nullptr) {
-                    return errors::Internal("'completed' and 'uploaded' cannot be nullptr.");
-                }
-                uint64 file_size;
-                TF_RETURN_IF_ERROR(GetCurrentFileSize(&file_size));
-
-                string auth_token;
-                TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_, &auth_token));
+                string method = "PUT";
+                string date_str;
+                string customHead;
+                string resource;
 
                 std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
                 TF_RETURN_IF_ERROR(request->Init());
-                TF_RETURN_IF_ERROR(request->SetUri(session_uri));
-                TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
-                TF_RETURN_IF_ERROR(request->AddHeader(
-                        "Content-Range", strings::StrCat("bytes */", file_size)));
-                TF_RETURN_IF_ERROR(request->SetPutEmptyBody());
-                const Status &status = request->Send();
-                if (status.ok()) {
-                    *completed = true;
-                    return Status::OK();
-                }
-                *completed = false;
-                if (request->GetResponseCode() != HTTP_CODE_RESUME_INCOMPLETE) {
-                    TF_RETURN_WITH_CONTEXT_IF_ERROR(status, " when resuming upload ",
-                                                    GetJssPath());
-                }
-                const string &received_range = request->GetResponseHeader("Range");
-                if (received_range.empty()) {
-                    // This means JSS doesn't have any bytes of the file yet.
-                    *uploaded = 0;
-                } else {
-                    StringPiece range_piece(received_range);
-                    range_piece.Consume("bytes=");  // May or may not be present.
-                    std::vector<int64> range_parts;
-                    if (!str_util::SplitAndParseAsInts(range_piece, '-', &range_parts) ||
-                        range_parts.size() != 2) {
-                        return errors::Internal("Unexpected response from JSS when writing ",
-                                                GetJssPath(), ": Range header '",
-                                                received_range, "' could not be parsed.");
-                    }
-                    if (range_parts[0] != 0) {
-                        return errors::Internal("Unexpected response from JSS when writing to ",
-                                                GetJssPath(), ": the returned range '",
-                                                received_range, "' does not start at zero.");
-                    }
-                    // If JSS returned "Range: 0-10", this means 11 bytes were uploaded.
-                    *uploaded = range_parts[1] + 1;
-                }
-                return Status::OK();
-            }
+                TF_RETURN_IF_ERROR(
+                        request->SetUri(strings::StrCat("http://", auth_provider_->GetEndPoint(), "/", bucket_,
+                                                        "/", request->EscapeString(object_))));
 
-            Status UploadToSession(const string &session_uri, uint64 start_offset) {
+                TF_RETURN_IF_ERROR(get_time_str(&date_str));
+                TF_RETURN_IF_ERROR(request->AddHeader("Date", date_str));
+                resource = strings::StrCat("/", bucket_, "/", request->EscapeString(object_));
+                TF_RETURN_IF_ERROR(JssAuthProvider::GetToken(auth_provider_, request.get(), &auth_token,
+                                                             &method, &date_str, &customHead, &resource));
+                TF_RETURN_IF_ERROR(request->AddHeader("Authorization", auth_token));
+
                 uint64 file_size;
                 TF_RETURN_IF_ERROR(GetCurrentFileSize(&file_size));
 
-                string auth_token;
-                TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_, &auth_token));
-
-                std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
-                TF_RETURN_IF_ERROR(request->Init());
-                TF_RETURN_IF_ERROR(request->SetUri(session_uri));
-                TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
+                size_t start_offset = 0;
                 if (file_size > 0) {
                     TF_RETURN_IF_ERROR(request->AddHeader(
                             "Content-Range", strings::StrCat("bytes ", start_offset, "-",
@@ -552,7 +471,7 @@ namespace tensorflow {
 
             string bucket_;
             string object_;
-            AuthProvider *auth_provider_;
+            JssAuthProvider *auth_provider_;
             string tmp_content_filename_;
             std::ofstream outfile_;
             HttpRequest::Factory *http_request_factory_;
@@ -575,11 +494,11 @@ namespace tensorflow {
     }  // namespace
 
     JssFileSystem::JssFileSystem()
-            : auth_provider_(new GoogleAuthProvider()),
+            : auth_provider_(new JssAuthProvider()),
               http_request_factory_(new HttpRequest::Factory()) {}
 
     JssFileSystem::JssFileSystem(
-            std::unique_ptr<AuthProvider> auth_provider,
+            std::unique_ptr<JssAuthProvider> auth_provider,
             std::unique_ptr<HttpRequest::Factory> http_request_factory,
             size_t read_ahead_bytes, int32 max_upload_attempts)
             : auth_provider_(std::move(auth_provider)),
@@ -714,31 +633,35 @@ namespace tensorflow {
         }
 
         string auth_token;
-        TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_.get(), &auth_token));
+        string method = "GET";
+        string date_str;
+        string customHead;
+        string resource;
 
-        std::vector<char> output_buffer;
         std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
         TF_RETURN_IF_ERROR(request->Init());
-        TF_RETURN_IF_ERROR(request->SetUri(strings::StrCat(
-                kJssUriBase, "b/", bucket, "/o/", request->EscapeString(object),
-                "?fields=size%2Cupdated")));
-        TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
-        TF_RETURN_IF_ERROR(request->SetResultBuffer(&output_buffer));
+        TF_RETURN_IF_ERROR(
+                request->SetUri(strings::StrCat("http://", auth_provider_->GetEndPoint(), "/", bucket,
+                                                "/", request->EscapeString(object))));
+
+        TF_RETURN_IF_ERROR(get_time_str(&date_str));
+        TF_RETURN_IF_ERROR(request->AddHeader("Date", date_str));
+        resource = strings::StrCat("/", bucket, "/", request->EscapeString(object));
+        TF_RETURN_IF_ERROR(JssAuthProvider::GetToken(auth_provider_.get(), request.get(), &auth_token,
+                                                     &method, &date_str, &customHead, &resource));
+        TF_RETURN_IF_ERROR(request->AddHeader("Authorization", auth_token));
+
         TF_RETURN_WITH_CONTEXT_IF_ERROR(
                 request->Send(), " when reading metadata of jss://", bucket, "/", object);
 
-        StringPiece response_piece =
-                StringPiece(output_buffer.data(), output_buffer.size());
-        Json::Value root;
-        TF_RETURN_IF_ERROR(ParseJson(response_piece, &root));
 
         // Parse file size.
-        TF_RETURN_IF_ERROR(GetInt64Value(root, "size", &(stat->length)));
+        string content_length = request->GetResponseHeader("Content-Length");
+        TF_RETURN_IF_ERROR(parse_int64_string(content_length, &(stat->length)));
 
         // Parse file modification time.
-        string updated;
-        TF_RETURN_IF_ERROR(GetStringValue(root, "updated", &updated));
-        TF_RETURN_IF_ERROR(ParseRfc3339Time(updated, &(stat->mtime_nsec)));
+        string updated = request->GetResponseHeader("Last-Modified");
+        TF_RETURN_IF_ERROR(parse_time_str(updated, &(stat->mtime_nsec)));
 
         stat->is_directory = false;
 
@@ -749,24 +672,47 @@ namespace tensorflow {
         if (!result) {
             return errors::Internal("'result' cannot be nullptr.");
         }
+
         string auth_token;
-        TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_.get(), &auth_token));
+        string method = "GET";
+        string date_str;
+        string customHead;
+        string resource = "/";
 
         std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
         TF_RETURN_IF_ERROR(request->Init());
-        request->SetUri(strings::StrCat(kJssUriBase, "b/", bucket));
-        request->AddAuthBearerHeader(auth_token);
-        const Status status = request->Send();
-        switch (status.code()) {
-            case errors::Code::OK:
-                *result = true;
-                return Status::OK();
-            case errors::Code::NOT_FOUND:
-                *result = false;
-                return Status::OK();
-            default:
-                return status;
+        TF_RETURN_IF_ERROR(request->SetUri(strings::StrCat("http://", auth_provider_->GetEndPoint(), "/")));
+        TF_RETURN_IF_ERROR(get_time_str(&date_str));
+        TF_RETURN_IF_ERROR(request->AddHeader("Date", date_str));
+        TF_RETURN_IF_ERROR(JssAuthProvider::GetToken(auth_provider_.get(), request.get(), &auth_token,
+                                                     &method, &date_str, &customHead, &resource));
+        TF_RETURN_IF_ERROR(request->AddHeader("Authorization", auth_token));
+
+        std::vector<char> output_buffer;
+        TF_RETURN_IF_ERROR(request->SetResultBuffer(&output_buffer));
+
+        TF_RETURN_WITH_CONTEXT_IF_ERROR(request->Send(), " when reading metadata of jss://", bucket);
+
+        StringPiece response_piece =
+                StringPiece(output_buffer.data(), output_buffer.size());
+        Json::Value root;
+        TF_RETURN_IF_ERROR(ParseJson(response_piece, &root));
+
+        Json::Value buckets = root.get("Buckets", Json::Value::null);
+        if (buckets) {
+            for (int i = 0; i < buckets.size(); i++) {
+                Json::Value bucket_json = buckets.get(i, Json::Value::null);
+                if (!bucket_json) continue;
+                string bucket_name;
+                TF_RETURN_IF_ERROR(GetStringValue(bucket_json, "Name", &bucket_name));
+                if (bucket_name.compare(bucket) == 0) {
+                    *result = true;
+                    return Status::OK();
+                }
+            }
         }
+        *result = false;
+        return Status::OK();
     }
 
     Status JssFileSystem::FolderExists(const string &dirname, bool *result) {
@@ -827,115 +773,55 @@ namespace tensorflow {
         string bucket, object_prefix;
         TF_RETURN_IF_ERROR(
                 ParseJssPath(MaybeAppendSlash(dirname), true, &bucket, &object_prefix));
+        // while (object_prefix[object_prefix.size() - 1] == '/') object_prefix.resize(object_prefix.size() - 1);
 
-        string nextPageToken;
-        uint64 retrieved_results = 0;
-        while (true) {  // A loop over multiple result pages.
-            string auth_token;
-            TF_RETURN_IF_ERROR(
-                    AuthProvider::GetToken(auth_provider_.get(), &auth_token));
+        string auth_token;
+        string method = "GET";
+        string date_str;
+        string customHead;
+        string resource = strings::StrCat("/", bucket);
 
-            std::vector<char> output_buffer;
-            std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
-            TF_RETURN_IF_ERROR(request->Init());
-            auto uri = strings::StrCat(kJssUriBase, "b/", bucket, "/o");
-            if (recursive) {
-                uri = strings::StrCat(uri, "?fields=items%2Fname%2CnextPageToken");
-            } else {
-                // Set "/" as a delimiter to ask JSS to treat subfolders as children
-                // and return them in "prefixes".
-                uri = strings::StrCat(uri,
-                                      "?fields=items%2Fname%2Cprefixes%2CnextPageToken");
-                uri = strings::StrCat(uri, "&delimiter=%2F");
-            }
-            if (!object_prefix.empty()) {
-                uri = strings::StrCat(uri, "&prefix=",
-                                      request->EscapeString(object_prefix));
-            }
-            if (!nextPageToken.empty()) {
-                uri = strings::StrCat(uri, "&pageToken=",
-                                      request->EscapeString(nextPageToken));
-            }
-            if (max_results - retrieved_results < kGetChildrenDefaultPageSize) {
-                uri =
-                        strings::StrCat(uri, "&maxResults=", max_results - retrieved_results);
-            }
-            TF_RETURN_IF_ERROR(request->SetUri(uri));
-            TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
-            TF_RETURN_IF_ERROR(request->SetResultBuffer(&output_buffer));
-            TF_RETURN_WITH_CONTEXT_IF_ERROR(request->Send(), " when reading ", dirname);
-            Json::Value root;
-            StringPiece response_piece =
-                    StringPiece(output_buffer.data(), output_buffer.size());
-            TF_RETURN_IF_ERROR(ParseJson(response_piece, &root));
-            const auto items = root.get("items", Json::Value::null);
-            if (items != Json::Value::null) {
-                if (!items.isArray()) {
-                    return errors::Internal(
-                            "Expected an array 'items' in the JSS response.");
-                }
-                for (size_t i = 0; i < items.size(); i++) {
-                    const auto item = items.get(i, Json::Value::null);
-                    if (!item.isObject()) {
-                        return errors::Internal(
-                                "Unexpected JSON format: 'items' should be a list of objects.");
-                    }
-                    string name;
-                    TF_RETURN_IF_ERROR(GetStringValue(item, "name", &name));
-                    // The names should be relative to the 'dirname'. That means the
-                    // 'object_prefix', which is part of 'dirname', should be removed from
-                    // the beginning of 'name'.
-                    StringPiece relative_path(name);
-                    if (!relative_path.Consume(object_prefix)) {
-                        return errors::Internal(strings::StrCat(
-                                "Unexpected response: the returned file name ", name,
-                                " doesn't match the prefix ", object_prefix));
-                    }
-                    if (!relative_path.empty() || include_self_directory_marker) {
-                        result->emplace_back(relative_path.ToString());
-                    }
-                    if (++retrieved_results >= max_results) {
-                        return Status::OK();
-                    }
-                }
-            }
-            const auto prefixes = root.get("prefixes", Json::Value::null);
-            if (prefixes != Json::Value::null) {
-                // Subfolders are returned for the non-recursive mode.
-                if (!prefixes.isArray()) {
-                    return errors::Internal(
-                            "'prefixes' was expected to be an array in the JSS response.");
-                }
-                for (size_t i = 0; i < prefixes.size(); i++) {
-                    const auto prefix = prefixes.get(i, Json::Value::null);
-                    if (prefix == Json::Value::null || !prefix.isString()) {
-                        return errors::Internal(
-                                "'prefixes' was expected to be an array of strings in the JSS "
-                                        "response.");
-                    }
-                    const string &prefix_str = prefix.asString();
-                    StringPiece relative_path(prefix_str);
-                    if (!relative_path.Consume(object_prefix)) {
-                        return errors::Internal(
-                                "Unexpected response: the returned folder name ", prefix_str,
-                                " doesn't match the prefix ", object_prefix);
-                    }
-                    result->emplace_back(relative_path.ToString());
-                    if (++retrieved_results >= max_results) {
-                        return Status::OK();
-                    }
-                }
-            }
-            const auto token = root.get("nextPageToken", Json::Value::null);
-            if (token == Json::Value::null) {
-                return Status::OK();
-            }
-            if (!token.isString()) {
-                return errors::Internal(
-                        "Unexpected response: nextPageToken is not a string");
-            }
-            nextPageToken = token.asString();
+        std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
+        TF_RETURN_IF_ERROR(request->Init());
+
+        string url_full;
+        if (!include_self_directory_marker) {
+            object_prefix.append("/");
         }
+        url_full = strings::StrCat("http://", auth_provider_->GetEndPoint(), "/", request->EscapeString(bucket),
+                                   "?prefix=", request->EscapeString(object_prefix),
+                                   "&maxKeys=", max_results);
+        if (!recursive) {
+            url_full.append("&delimiter=%2F");
+        }
+        TF_RETURN_IF_ERROR(request->SetUri(url_full));
+        TF_RETURN_IF_ERROR(get_time_str(&date_str));
+        TF_RETURN_IF_ERROR(request->AddHeader("Date", date_str));
+        TF_RETURN_IF_ERROR(JssAuthProvider::GetToken(auth_provider_.get(), request.get(), &auth_token,
+                                                     &method, &date_str, &customHead, &resource));
+        TF_RETURN_IF_ERROR(request->AddHeader("Authorization", auth_token));
+
+        std::vector<char> output_buffer;
+        TF_RETURN_IF_ERROR(request->SetResultBuffer(&output_buffer));
+
+        TF_RETURN_WITH_CONTEXT_IF_ERROR(request->Send(), " when reading ", dirname);
+
+        StringPiece response_piece =
+                StringPiece(output_buffer.data(), output_buffer.size());
+        Json::Value root;
+        TF_RETURN_IF_ERROR(ParseJson(response_piece, &root));
+        Json::Value contents = root.get("Contents", Json::Value::null);
+        if (contents) {
+            for (int i = 0; i < contents.size(); i++) {
+                Json::Value object_info = contents.get(i, Json::Value::null);
+                string object_key;
+                TF_RETURN_IF_ERROR(GetStringValue(&object_info, "Key", &object_key));
+                if (include_self_directory_marker || object_prefix.compare(object_key) != 0) {
+                    result->emplace_back(strings::StrCat("jss://", bucket, "/", object_key));
+                }
+            }
+        }
+        return Status::OK();
     }
 
     Status JssFileSystem::Stat(const string &fname, FileStatistics *stat) {
@@ -975,15 +861,26 @@ namespace tensorflow {
         TF_RETURN_IF_ERROR(ParseJssPath(fname, false, &bucket, &object));
 
         string auth_token;
-        TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_.get(), &auth_token));
+        string method = "DELETE";
+        string date_str;
+        string customHead;
+        string resource;
 
         std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
         TF_RETURN_IF_ERROR(request->Init());
-        TF_RETURN_IF_ERROR(request->SetUri(strings::StrCat(
-                kJssUriBase, "b/", bucket, "/o/", request->EscapeString(object))));
-        TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
+        TF_RETURN_IF_ERROR(
+                request->SetUri(strings::StrCat("http://", auth_provider_->GetEndPoint(), "/", bucket,
+                                                "/", request->EscapeString(object))));
+        TF_RETURN_IF_ERROR(get_time_str(&date_str));
+        TF_RETURN_IF_ERROR(request->AddHeader("Date", date_str));
+
+        resource = strings::StrCat("/", bucket, "/", request->EscapeString(object));
+        TF_RETURN_IF_ERROR(JssAuthProvider::GetToken(auth_provider_.get(), request.get(), &auth_token,
+                                                     &method, &date_str, &customHead, &resource));
+        TF_RETURN_IF_ERROR(request->AddHeader("Authorization", auth_token));
+
         TF_RETURN_IF_ERROR(request->SetDeleteRequest());
-        TF_RETURN_WITH_CONTEXT_IF_ERROR(request->Send(), " when deleting ", fname);
+        TF_RETURN_WITH_CONTEXT_IF_ERROR(request->Send(), " when deleting", fname);
         return Status::OK();
     }
 
@@ -1061,41 +958,43 @@ namespace tensorflow {
     Status JssFileSystem::RenameObject(const string &src, const string &target) {
         string src_bucket, src_object, target_bucket, target_object;
         TF_RETURN_IF_ERROR(ParseJssPath(src, false, &src_bucket, &src_object));
-        TF_RETURN_IF_ERROR(
-                ParseJssPath(target, false, &target_bucket, &target_object));
+        TF_RETURN_IF_ERROR(ParseJssPath(target, false, &target_bucket, &target_object));
+
 
         string auth_token;
-        TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_.get(), &auth_token));
+        string method = "PUT";
+        string date_str;
+        string customHead;
+        string resource;
 
         std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
         TF_RETURN_IF_ERROR(request->Init());
-        TF_RETURN_IF_ERROR(request->SetUri(strings::StrCat(
-                kJssUriBase, "b/", src_bucket, "/o/", request->EscapeString(src_object),
-                "/rewriteTo/b/", target_bucket, "/o/",
-                request->EscapeString(target_object))));
-        TF_RETURN_IF_ERROR(request->AddAuthBearerHeader(auth_token));
-        TF_RETURN_IF_ERROR(request->SetPostEmptyBody());
+        TF_RETURN_IF_ERROR(
+                request->SetUri(strings::StrCat("http://", auth_provider_->GetEndPoint(), "/", target_bucket,
+                                                "/", request->EscapeString(target_object))));
+
+        TF_RETURN_IF_ERROR(get_time_str(&date_str));
+        TF_RETURN_IF_ERROR(request->AddHeader("Date", date_str));
+        string copy_header = strings::StrCat("/", target_bucket, "/", request->EscapeString(target_object));
+        TF_RETURN_IF_ERROR(request->AddHeader("x-jss-copy-source", date_str));
+        customHead = strings::StrCat("x-jss-copy-source:", copy_header);
+        resource = strings::StrCat("/", target_bucket, "/", request->EscapeString(target_object));
+        TF_RETURN_IF_ERROR(JssAuthProvider::GetToken(auth_provider_.get(), request.get(), &auth_token,
+                                                     &method, &date_str, &customHead, &resource));
+        TF_RETURN_IF_ERROR(request->AddHeader("Authorization", auth_token));
+
+        TF_RETURN_IF_ERROR(request->SetPutEmptyBody());
         std::vector<char> output_buffer;
         TF_RETURN_IF_ERROR(request->SetResultBuffer(&output_buffer));
-        TF_RETURN_WITH_CONTEXT_IF_ERROR(request->Send(), " when renaming ", src,
-                                        " to ", target);
 
+        TF_RETURN_WITH_CONTEXT_IF_ERROR(request->Send(), " when renaming ", src, " to ", target);
+
+        StringPiece response_piece = StringPiece(output_buffer.data(), output_buffer.size());
         Json::Value root;
-        StringPiece response_piece =
-                StringPiece(output_buffer.data(), output_buffer.size());
         TF_RETURN_IF_ERROR(ParseJson(response_piece, &root));
-        bool done;
-        TF_RETURN_IF_ERROR(GetBoolValue(root, "done", &done));
-        if (!done) {
-            // If JSS didn't complete rewrite in one call, this means that a large file
-            // is being copied to a bucket with a different storage class or location,
-            // which requires multiple rewrite calls.
-            // TODO(surkov): implement multi-step rewrites.
-            return errors::Unimplemented(
-                    "Couldn't rename ", src, " to ", target,
-                    ": moving large files between buckets with different "
-                            "locations or storage classes is not supported.");
-        }
+
+        string etag; // 几乎没用，就算验证接口正常罢了
+        TF_RETURN_IF_ERROR(GetStringValue(root, "Etag", &etag));
 
         TF_RETURN_IF_ERROR(DeleteFile(src));
         return Status::OK();
@@ -1162,6 +1061,61 @@ namespace tensorflow {
         return Status::OK();
     }
 
-    REGISTER_FILE_SYSTEM("jss", RetryingJssFileSystem);
+    JssAuthProvider::JssAuthProvider() {}
+
+    JssAuthProvider::JssAuthProvider(const string &access_key, const string &access_secret_key,
+                                     const string &endpoint)
+            : access_key_(access_key),
+              access_secret_key_(access_secret_key),
+              endpoint_(endpoint) {
+        if (endpoint_ == NULL || endpoint_.size() == 0) {
+            endpoint_.assign(kStorageHost);
+        }
+    }
+
+    Status JssAuthProvider::GetToken(HttpRequest *request, string *token,
+                                     const string *method, const string *date, const string *customHead,
+                                     const string *resource) {
+        if (!request) {
+            return errors::Internal("http request is required.");
+        }
+        if (!token) {
+            return errors::Internal("token for out is required.");
+        }
+        if (!method) { return errors::Internal("method is required."); }
+        if (!date) { return errors::Internal("date is required."); }
+        if (!resource) { return errors::Internal("resource is required."); }
+
+        string string_to_sign;
+        string_to_sign.append(method->c_str()).append("\n") // method
+                .append("\n") // md5
+                .append("application/octet-stream") // Content-Type
+                .append(date->c_str()).append("\n") // date string
+                ;
+        if (customHead && customHead->size() > 0) {
+            string_to_sign.append(customHead->c_str()).append("\n"); // customHead
+        }
+        string_to_sign.append(resource->c_str()).append("\n"); // resource
+
+        string signed_str;
+        TF_RETURN_IF_ERROR(sign(&access_secret_key_, &string_to_sign, &signed_str));
+        token->assign(strings::StrCat("jingdong ", access_key_, ":", signed_str));
+    }
+
+    const string JssAuthProvider::GetEndPoint() {
+        return endpoint_;
+    }
+
+    static Status JssAuthProvider::GetToken(JssAuthProvider *provider, HttpRequest *request, string *token,
+                                            const string *method, const string *date, const string *customHead,
+                                            const string *resource) {
+        if (!provider) {
+            return errors::Internal("Auth provider is required.");
+        }
+        return provider->GetToken(request, token, method, date, customHead, resource);
+    }
+
+
+    REGISTER_FILE_SYSTEM("gs", RetryingJssFileSystem);
 
 }  // namespace tensorflow
